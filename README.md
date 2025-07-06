@@ -62,7 +62,7 @@ A production-ready Document + LLaMA RAG system optimized for Azure Container App
 ### 1. Clone and Configure
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/snedea/docullama.git
 cd docullama
 
 # Copy environment template
