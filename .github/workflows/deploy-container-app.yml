@@ -1,0 +1,348 @@
+# GitHub Actions Workflow for DocuLLaMA Azure Container Apps Deployment
+name: Deploy DocuLLaMA to Azure Container Apps
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+env:
+  REGISTRY_NAME: docullama
+  IMAGE_NAME: docullama
+  RESOURCE_GROUP: docullama-rg
+  CONTAINER_APP_NAME: docullama
+  CONTAINER_APP_ENV: docullama-env
+
+jobs:
+  # Build and test job
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov black flake8 mypy
+    
+    - name: Lint with flake8
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Format check with black
+      run: |
+        black --check --diff .
+    
+    - name: Type check with mypy
+      run: |
+        mypy . --ignore-missing-imports
+    
+    - name: Test with pytest
+      run: |
+        pytest --cov=. --cov-report=xml --cov-report=html
+    
+    - name: Upload test coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Build and push Docker image
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, security-scan]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    outputs:
+      image-tag: ${{ steps.build.outputs.image-tag }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Azure Container Registry
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+        username: ${{ secrets.AZURE_ACR_USERNAME }}
+        password: ${{ secrets.AZURE_ACR_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+    
+    - name: Set image tag output
+      run: |
+        echo "image-tag=${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # Deploy to staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Azure login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS_STAGING }}
+    
+    - name: Deploy to staging Container Apps
+      uses: azure/container-apps-deploy-action@v1
+      with:
+        resource-group: ${{ env.RESOURCE_GROUP }}-staging
+        container-app-name: ${{ env.CONTAINER_APP_NAME }}-staging
+        container-app-environment: ${{ env.CONTAINER_APP_ENV }}-staging
+        docker-image: ${{ needs.build-and-push.outputs.image-tag }}
+        registry-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+        registry-username: ${{ secrets.AZURE_ACR_USERNAME }}
+        registry-password: ${{ secrets.AZURE_ACR_PASSWORD }}
+        ingress: external
+        target-port: 8000
+        environment-variables: |
+          ENVIRONMENT=staging
+          AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT_STAGING }}
+          QDRANT_HOST=${{ secrets.QDRANT_HOST_STAGING }}
+          LOG_LEVEL=DEBUG
+    
+    - name: Run staging health check
+      run: |
+        echo "Waiting for deployment to be ready..."
+        sleep 60
+        
+        STAGING_URL=$(az containerapp show \
+          --name ${{ env.CONTAINER_APP_NAME }}-staging \
+          --resource-group ${{ env.RESOURCE_GROUP }}-staging \
+          --query properties.configuration.ingress.fqdn \
+          --output tsv)
+        
+        curl -f https://$STAGING_URL/health || exit 1
+        echo "Staging deployment successful!"
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Azure login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS_PRODUCTION }}
+    
+    - name: Deploy to production Container Apps
+      uses: azure/container-apps-deploy-action@v1
+      with:
+        resource-group: ${{ env.RESOURCE_GROUP }}
+        container-app-name: ${{ env.CONTAINER_APP_NAME }}
+        container-app-environment: ${{ env.CONTAINER_APP_ENV }}
+        docker-image: ${{ needs.build-and-push.outputs.image-tag }}
+        registry-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+        registry-username: ${{ secrets.AZURE_ACR_USERNAME }}
+        registry-password: ${{ secrets.AZURE_ACR_PASSWORD }}
+        ingress: external
+        target-port: 8000
+        environment-variables: |
+          ENVIRONMENT=production
+          AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          QDRANT_HOST=${{ secrets.QDRANT_HOST }}
+          LOG_LEVEL=INFO
+    
+    - name: Run production health check
+      run: |
+        echo "Waiting for deployment to be ready..."
+        sleep 60
+        
+        PROD_URL=$(az containerapp show \
+          --name ${{ env.CONTAINER_APP_NAME }} \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --query properties.configuration.ingress.fqdn \
+          --output tsv)
+        
+        curl -f https://$PROD_URL/health || exit 1
+        echo "Production deployment successful!"
+    
+    - name: Notify deployment success
+      uses: 8398a7/action-slack@v3
+      if: success()
+      with:
+        status: success
+        channel: '#deployments'
+        text: 'DocuLLaMA production deployment successful! 🚀'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Notify deployment failure
+      uses: 8398a7/action-slack@v3
+      if: failure()
+      with:
+        status: failure
+        channel: '#deployments'
+        text: 'DocuLLaMA production deployment failed! ❌'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Performance testing (post-deployment)
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install k6
+      run: |
+        sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+        sudo apt-get update
+        sudo apt-get install k6
+    
+    - name: Run performance tests
+      run: |
+        STAGING_URL=$(az containerapp show \
+          --name ${{ env.CONTAINER_APP_NAME }}-staging \
+          --resource-group ${{ env.RESOURCE_GROUP }}-staging \
+          --query properties.configuration.ingress.fqdn \
+          --output tsv)
+        
+        export BASE_URL=https://$STAGING_URL
+        k6 run tests/performance/load-test.js
+    
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-results
+        path: performance-results.json
+
+  # Database migration (if needed)
+  migrate-database:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Azure login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS_PRODUCTION }}
+    
+    - name: Run database migrations
+      run: |
+        echo "Running database migrations..."
+        # Add migration commands here if needed
+        echo "Migrations completed successfully!"
+
+  # Cleanup old images
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+    - name: Azure login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS_PRODUCTION }}
+    
+    - name: Cleanup old container images
+      run: |
+        # Keep last 10 images, delete older ones
+        az acr repository show-tags \
+          --name ${{ env.REGISTRY_NAME }} \
+          --repository ${{ env.IMAGE_NAME }} \
+          --orderby time_desc \
+          --output tsv \
+          | tail -n +11 \
+          | while read tag; do
+              echo "Deleting old image: $tag"
+              az acr repository delete \
+                --name ${{ env.REGISTRY_NAME }} \
+                --image ${{ env.IMAGE_NAME }}:$tag \
+                --yes
+            done

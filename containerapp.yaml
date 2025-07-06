@@ -1,0 +1,342 @@
+# Azure Container Apps Deployment Configuration for DocuLLaMA
+# Production-ready configuration with Qdrant Cloud integration
+
+location: East US
+resourceGroup: docullama-rg
+name: docullama
+type: Microsoft.App/containerApps
+properties:
+  managedEnvironmentId: /subscriptions/{subscription-id}/resourceGroups/docullama-rg/providers/Microsoft.App/managedEnvironments/docullama-env
+  configuration:
+    ingress:
+      external: true
+      targetPort: 8000
+      transport: http
+      allowInsecure: false
+      traffic:
+        - weight: 100
+          latestRevision: true
+      corsPolicy:
+        allowedOrigins:
+          - "*"
+        allowedMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        allowedHeaders:
+          - "*"
+        allowCredentials: true
+    
+    secrets:
+      - name: azure-openai-api-key
+        keyVaultUrl: https://docullama-kv.vault.azure.net/secrets/azure-openai-api-key
+        identity: system
+      
+      - name: qdrant-api-key
+        keyVaultUrl: https://docullama-kv.vault.azure.net/secrets/qdrant-api-key
+        identity: system
+      
+      - name: jwt-secret-key
+        keyVaultUrl: https://docullama-kv.vault.azure.net/secrets/jwt-secret-key
+        identity: system
+    
+    registries:
+      - server: docullama.azurecr.io
+        identity: system
+    
+    activeRevisionsMode: Single
+    
+  template:
+    revisionSuffix: v1
+    containers:
+      - image: docullama.azurecr.io/docullama:latest
+        name: docullama
+        env:
+          # Azure Container Apps required
+          - name: PORT
+            value: "8000"
+          - name: WORKERS
+            value: "4"
+          - name: TIMEOUT
+            value: "300"
+          - name: ENVIRONMENT
+            value: "production"
+          
+          # Azure OpenAI Configuration
+          - name: AZURE_OPENAI_ENDPOINT
+            value: "https://docullama-openai.openai.azure.com/"
+          - name: AZURE_OPENAI_API_KEY
+            secretRef: azure-openai-api-key
+          - name: AZURE_OPENAI_API_VERSION
+            value: "2024-02-01"
+          - name: AZURE_OPENAI_CHAT_MODEL
+            value: "gpt-4o-mini"
+          - name: AZURE_OPENAI_EMBEDDING_MODEL
+            value: "text-embedding-3-small"
+          - name: AZURE_OPENAI_EMBEDDING_DIMENSIONS
+            value: "768"
+          
+          # Qdrant Cloud Configuration
+          - name: QDRANT_HOST
+            value: "c50e289b-40c6-46bc-b9ae-065b9a62502d.eastus-0.azure.cloud.qdrant.io"
+          - name: QDRANT_PORT
+            value: "6333"
+          - name: QDRANT_API_KEY
+            secretRef: qdrant-api-key
+          - name: QDRANT_COLLECTION_NAME
+            value: "docullama_documents"
+          - name: QDRANT_USE_HTTPS
+            value: "true"
+          
+          # Document Processing
+          - name: TIKA_SERVER_URL
+            value: "http://localhost:9998"
+          - name: MAX_FILE_SIZE_MB
+            value: "100"
+          - name: CHUNK_SIZE
+            value: "512"
+          - name: CHUNK_OVERLAP
+            value: "50"
+          - name: MIN_CHUNK_SIZE
+            value: "50"
+          - name: QUALITY_THRESHOLD
+            value: "0.6"
+          - name: ENABLE_OCR
+            value: "true"
+          
+          # RAG Configuration
+          - name: MAX_CONTEXT_LENGTH
+            value: "8192"
+          - name: MAX_SEARCH_RESULTS
+            value: "10"
+          - name: RERANK_TOP_K
+            value: "5"
+          - name: ENABLE_HYBRID_SEARCH
+            value: "true"
+          - name: ENABLE_RERANKING
+            value: "true"
+          - name: SIMILARITY_THRESHOLD
+            value: "0.7"
+          - name: RESPONSE_TEMPERATURE
+            value: "0.3"
+          - name: RESPONSE_MAX_TOKENS
+            value: "2048"
+          
+          # Security
+          - name: JWT_SECRET_KEY
+            secretRef: jwt-secret-key
+          - name: ENABLE_API_KEY_AUTH
+            value: "true"
+          - name: CORS_ORIGINS
+            value: "*"
+          
+          # Monitoring
+          - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+            value: "InstrumentationKey=your-app-insights-key"
+          - name: LOG_LEVEL
+            value: "INFO"
+          - name: ENABLE_STRUCTURED_LOGGING
+            value: "true"
+          - name: ENABLE_OPENTELEMETRY
+            value: "true"
+          - name: ENABLE_COST_TRACKING
+            value: "true"
+          
+          # Health Checks
+          - name: HEALTH_CHECK_TIMEOUT
+            value: "10"
+          - name: READINESS_CHECK_DEPENDENCIES
+            value: "qdrant,azure_openai,tika"
+          
+          # Advanced Features
+          - name: ENABLE_RESEARCH_INTELLIGENCE
+            value: "true"
+          - name: ENABLE_KNOWLEDGE_GRAPH
+            value: "true"
+          - name: ENABLE_MULTI_SOURCE_RAG
+            value: "true"
+          - name: ENABLE_CITATION_FORMATTING
+            value: "true"
+        
+        resources:
+          cpu: 2.0
+          memory: 4Gi
+        
+        probes:
+          liveness:
+            httpGet:
+              path: /live
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          
+          readiness:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          
+          startup:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 10
+    
+    scale:
+      minReplicas: 1
+      maxReplicas: 10
+      rules:
+        - name: http-scaling
+          http:
+            metadata:
+              concurrentRequests: "50"
+        
+        - name: cpu-scaling
+          custom:
+            type: cpu
+            metadata:
+              type: Utilization
+              value: "70"
+        
+        - name: memory-scaling
+          custom:
+            type: memory
+            metadata:
+              type: Utilization
+              value: "80"
+
+  identity:
+    type: SystemAssigned
+
+---
+# Container Apps Environment
+apiVersion: v1
+kind: containerAppEnvironment
+metadata:
+  name: docullama-env
+  location: East US
+  resourceGroup: docullama-rg
+properties:
+  type: Managed
+  
+  # Log Analytics Workspace for monitoring
+  appLogsConfiguration:
+    destination: log-analytics
+    logAnalyticsConfiguration:
+      customerId: /subscriptions/{subscription-id}/resourceGroups/docullama-rg/providers/Microsoft.OperationalInsights/workspaces/docullama-logs
+      sharedKey: workspace-shared-key
+  
+  # Virtual Network integration (optional)
+  vnetConfiguration:
+    internal: false
+  
+  # Dapr configuration (if needed)
+  daprAIInstrumentationKey: your-app-insights-key
+  daprAIConnectionString: InstrumentationKey=your-app-insights-key
+
+---
+# Azure Container Registry
+apiVersion: v1
+kind: containerRegistry
+metadata:
+  name: docullama
+  location: East US
+  resourceGroup: docullama-rg
+properties:
+  sku:
+    name: Standard
+  adminUserEnabled: false
+  
+  # Managed identity access
+  systemAssignedIdentity: true
+  
+  # Network access
+  networkRuleSet:
+    defaultAction: Allow
+  
+  # Retention policy
+  policies:
+    retentionPolicy:
+      status: enabled
+      days: 30
+
+---
+# Key Vault for secrets management
+apiVersion: v1
+kind: keyVault
+metadata:
+  name: docullama-kv
+  location: East US
+  resourceGroup: docullama-rg
+properties:
+  sku:
+    family: A
+    name: standard
+  
+  tenantId: your-tenant-id
+  
+  # Access policies for Container Apps managed identity
+  accessPolicies:
+    - tenantId: your-tenant-id
+      objectId: container-app-managed-identity-object-id
+      permissions:
+        secrets:
+          - get
+          - list
+  
+  # Enable for Container Apps
+  enabledForDeployment: true
+  enabledForTemplateDeployment: true
+  
+  # Network access
+  networkAcls:
+    defaultAction: Allow
+
+---
+# Application Insights for monitoring
+apiVersion: v1
+kind: applicationInsights
+metadata:
+  name: docullama-insights
+  location: East US
+  resourceGroup: docullama-rg
+properties:
+  Application_Type: web
+  
+  # Link to Log Analytics workspace
+  WorkspaceResourceId: /subscriptions/{subscription-id}/resourceGroups/docullama-rg/providers/Microsoft.OperationalInsights/workspaces/docullama-logs
+  
+  # Retention
+  RetentionInDays: 90
+  
+  # Sampling
+  SamplingPercentage: 100
+
+---
+# Log Analytics Workspace
+apiVersion: v1
+kind: logAnalyticsWorkspace
+metadata:
+  name: docullama-logs
+  location: East US
+  resourceGroup: docullama-rg
+properties:
+  sku:
+    name: PerGB2018
+  
+  # Retention
+  retentionInDays: 30
+  
+  # Daily quota
+  workspaceCapping:
+    dailyQuotaGb: 10

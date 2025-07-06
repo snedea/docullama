@@ -1,0 +1,49 @@
+# Development dependencies for DocuLLaMA
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+pytest-httpx==0.25.0
+
+# Code formatting and linting
+black==23.11.0
+flake8==6.1.0
+isort==5.12.0
+autoflake==2.2.1
+
+# Type checking
+mypy==1.7.1
+types-requests==2.31.0.10
+types-redis==4.6.0.11
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.4.8
+mkdocs-mermaid2-plugin==1.1.1
+
+# Development tools
+pre-commit==3.6.0
+ipython==8.17.2
+jupyter==1.0.0
+
+# Performance testing
+locust==2.17.0
+
+# Security scanning
+bandit==1.7.5
+safety==2.3.5
+
+# Development server
+watchdog==3.0.0
+
+# Database tools for development
+alembic==1.13.0  # If database migrations needed
+
+# Mock services for testing
+responses==0.24.1
+httpretty==1.1.4
+
+# Load testing
+k6==0.1.0  # Python k6 integration if available
